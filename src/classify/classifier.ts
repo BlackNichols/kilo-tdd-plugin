@@ -51,7 +51,7 @@ export function createClassifier(
 
   const isExcluded = (absPath: string): boolean => {
     const p = rel(absPath)
-    return micromatch.isMatch(p, [...excludedPatterns, "**/node_modules/**", "**/.git/**"])
+    return micromatch.isMatch(p, [...excludedPatterns, "**/node_modules/**", "**/.git/**"], { dot: true })
   }
 
   const isTest = (absPath: string): boolean => {

@@ -96,6 +96,9 @@ export const DEFAULT_CONFIG: TddConfig = {
     "build/**",
     ".kilo/**",
     "coverage/**",
+    "test-results/**",
+    "playwright-report/**",
+    "blob-report/**",
   ],
   testRunners: [
     {

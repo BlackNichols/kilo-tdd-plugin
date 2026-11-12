@@ -74,6 +74,7 @@ npm test            # vitest run (unit + integration)
 - **Worktrees:** `worktreeEnabled` isolation not implemented; `true` is rejected fail-closed.
 - **Config:** partial loader/merge only; no schema validation; `testRunners` not configurable.
 - **GREEN commit scope:** conservative by default (rejects non-protected test/config changes in dirty set; stages implementation files excluding protected tests). Configurable via `allowNonProtectedTestConfigInGreenCommit`; atypical repos may still need pattern tuning.
+- **RED commits are baseline snapshots of all dirty, non-excluded files:** `tdd_commit_red` / `tdd_amend_red` stage the full dirty set (not only intended test files) and record committed files as the protected RED baseline. Generated artifacts (e.g. Playwright `test-results/`, reports) should be excluded via `excludedPatterns` and kept out of the working tree before RED/amend, otherwise they become protected and hard to normalize in-cycle. Defaults exclude `test-results/**`, `playwright-report/**`, and `blob-report/**`; override `excludedPatterns` if your runner writes artifacts elsewhere.
 
 ## Adversarial coverage (current)
 

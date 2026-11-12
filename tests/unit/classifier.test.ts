@@ -23,6 +23,12 @@ describe("file classifier", () => {
     expect(c.isTestConfig("vitest.config.ts")).toBe(true)
   })
 
+  it("excludes common generated test artifacts by default", () => {
+    expect(c.isExcluded("test-results/.last-run.json")).toBe(true)
+    expect(c.isExcluded("playwright-report/index.html")).toBe(true)
+    expect(c.isExcluded("blob-report/report.zip")).toBe(true)
+  })
+
   it("respects protected set", () => {
     const prot = new Set(["tests/foo.test.ts"])
     expect(c.isProtected("tests/foo.test.ts", prot)).toBe(true)
