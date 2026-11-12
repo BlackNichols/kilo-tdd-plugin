@@ -1,0 +1,47 @@
+{
+  "name": "kilo-tdd-plugin",
+  "version": "1.0.0",
+  "description": "Git-backed TDD enforcement plugin for Kilo Code. Drives a RED → commit → implementation → GREEN → commit state machine enforced through Git checkpoints.",
+  "type": "module",
+  "main": "src/plugin.ts",
+  "exports": {
+    ".": {
+      "types": "./src/plugin.ts",
+      "default": "./src/plugin.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src tests",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "tsc --noEmit"
+  },
+  "keywords": [
+    "kilo",
+    "kilocode",
+    "tdd",
+    "plugin",
+    "git",
+    "test-driven"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@kilocode/plugin": "^1.0.0"
+  },
+  "devDependencies": {
+    "@kilocode/plugin": "^1.0.0",
+    "@types/node": "^22.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "eslint": "^9.0.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.0.0"
+  },
+  "dependencies": {
+    "micromatch": "^4.0.8"
+  }
+}
