@@ -58,6 +58,21 @@ describe("TDD cycle integration", () => {
     expect(log).toContain("fix: implement")
   })
 
+  it("allows RED commit for colocated tests under production paths (test patterns take precedence)", async () => {
+    await h.callTool("tdd_start", { behavior: "colocated add" })
+
+    // colocated test in src/** (matches productionPatterns) but is a test file
+    await writeFile(
+      path.join(repo.dir, "src", "add.test.js"),
+      `import { test } from "node:test";\nimport assert from "node:assert";\nimport { add } from "./add.js";\ntest("adds", () => assert.strictEqual(add(1,2), 3));\n`,
+    )
+
+    await h.callTool("tdd_commit_red", { command: "node --test src/add.test.js" })
+    const cycle = await h.store.getActive(h.sessionID)
+    expect(cycle?.state).toBe(TddState.IMPLEMENTATION)
+    expect(cycle?.redCommit?.files).toHaveProperty("src/add.test.js")
+  })
+
   it("supports revert and amend-red correction flow", async () => {
     await h.callTool("tdd_start", { behavior: "mul" })
 

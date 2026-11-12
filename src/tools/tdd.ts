@@ -92,7 +92,10 @@ export function createTools(store: CycleStore, directory: string, config = DEFAU
 
         const dirty = (await git.allDirtyFiles()).filter((f) => !classifier.isExcluded(pathJoin(directory, f)))
         if (dirty.length === 0) throw new TddError(TddErrorCode.NO_TEST_IN_STAGED, "TDD enforcement: No modified files to commit as RED test.")
-        const prod = dirty.filter((f) => classifier.isProduction(pathJoin(directory, f)))
+        const prod = dirty.filter((f) => {
+          const p = pathJoin(directory, f)
+          return classifier.isProduction(p) && !classifier.isTest(p) && !classifier.isTestConfig(p)
+        })
         if (prod.length > 0) throw new TddError(TddErrorCode.PRODUCTION_IN_STAGED, `TDD enforcement: Production files modified in RED_TEST: ${prod.join(", ")}. Revert them before committing RED.`)
         const tests = dirty.filter((f) => !f.endsWith("/") && (classifier.isTest(pathJoin(directory, f)) || classifier.isTestConfig(pathJoin(directory, f))))
         const testFilesOnly = dirty.filter((f) => !f.endsWith("/") && classifier.isTest(pathJoin(directory, f)))
@@ -175,7 +178,10 @@ export function createTools(store: CycleStore, directory: string, config = DEFAU
         if (!cycle.redCommit) throw new TddError(TddErrorCode.NOT_FOUND, "TDD enforcement: No RED commit to amend.")
 
         const dirty = (await git.allDirtyFiles()).filter((f) => !classifier.isExcluded(pathJoin(directory, f)))
-        const prod = dirty.filter((f) => classifier.isProduction(pathJoin(directory, f)))
+        const prod = dirty.filter((f) => {
+          const p = pathJoin(directory, f)
+          return classifier.isProduction(p) && !classifier.isTest(p) && !classifier.isTestConfig(p)
+        })
         if (prod.length > 0) throw new TddError(TddErrorCode.PRODUCTION_IN_STAGED, `TDD enforcement: Production files modified in TEST_CORRECTION: ${prod.join(", ")}`)
         const dirtyTests = dirty.filter((f) => !f.endsWith("/") && (classifier.isTest(pathJoin(directory, f)) || classifier.isTestConfig(pathJoin(directory, f))))
         const dirtyTestFiles = dirty.filter((f) => !f.endsWith("/") && classifier.isTest(pathJoin(directory, f)))
