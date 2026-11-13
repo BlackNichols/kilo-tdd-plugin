@@ -5,6 +5,12 @@ import { TddError, TddErrorCode } from "./errors"
 
 type PartialConfig = Record<string, unknown>
 
+export interface LoadedConfig {
+  config: TddConfig
+  /** Where the effective plugin config came from (for diagnostics). */
+  source: string
+}
+
 function isObject(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === "object" && !Array.isArray(v)
 }
@@ -172,29 +178,67 @@ function stripJsonComments(raw: string): string {
   return out
 }
 
-export async function loadConfig(directory: string): Promise<TddConfig> {
-  const candidates = ["kilo.json", "kilo.jsonc", path.join(".kilo", "config.json")]
-  let lastError: unknown = null
-  for (const rel of candidates) {
+async function readJsonLike(file: string): Promise<any | null> {
+  try {
+    const raw = await readFile(file, "utf8")
+    return JSON.parse(stripJsonComments(raw))
+  } catch (e: any) {
+    if (e?.code === "ENOENT") return null
+    throw e
+  }
+}
+
+function extractPluginBlock(parsed: any): { block: unknown; key: string } | null {
+  if (!isObject(parsed)) return null
+  if (parsed.tdd != null) return { block: parsed.tdd, key: "tdd" }
+  if (isObject(parsed.pluginConfig) && parsed.pluginConfig["kilo-tdd-plugin"] != null) {
+    return { block: parsed.pluginConfig["kilo-tdd-plugin"], key: "pluginConfig.kilo-tdd-plugin" }
+  }
+  if (parsed["kilo-tdd-plugin"] != null) return { block: parsed["kilo-tdd-plugin"], key: "kilo-tdd-plugin" }
+  return null
+}
+
+export async function loadConfigWithSource(directory: string): Promise<LoadedConfig> {
+  // 1) Plugin-owned config files (not subject to host kilo.json schema validation)
+  const pluginOwned = [
+    path.join(".kilo", "tdd.json"),
+    path.join(".kilo", "tdd", "config.json"),
+    "kilo.tdd.json",
+  ]
+  for (const rel of pluginOwned) {
     try {
-      const raw = await readFile(path.join(directory, rel), "utf8")
-      const stripped = stripJsonComments(raw)
-      const parsed = JSON.parse(stripped) as any
-      const pluginCfg = parsed?.tdd ?? parsed?.pluginConfig?.["kilo-tdd-plugin"] ?? parsed?.["kilo-tdd-plugin"] ?? null
-      if (pluginCfg == null) continue
-      if (!isObject(pluginCfg)) throw new TddError(TddErrorCode.BLOCKED, `TDD config in ${rel} must be an object.`)
-      return mergeConfig(DEFAULT_CONFIG, pluginCfg)
+      const parsed = await readJsonLike(path.join(directory, rel))
+      if (parsed == null) continue
+      if (!isObject(parsed)) throw new TddError(TddErrorCode.BLOCKED, `TDD config in ${rel} must be an object.`)
+      return { config: mergeConfig(DEFAULT_CONFIG, parsed), source: rel }
     } catch (e) {
-      if ((e as any)?.code === "ENOENT") continue
-      lastError = e
-      // if file exists but config is invalid, fail closed
       if (e instanceof TddError) throw e
       if (e instanceof SyntaxError) throw new TddError(TddErrorCode.BLOCKED, `TDD config parse error in ${rel}: ${e.message}`)
-      // other read errors: try next? but likely real problem
-      if ((e as any)?.code) continue
       throw e
     }
   }
-  if (lastError instanceof TddError) throw lastError
-  return DEFAULT_CONFIG
+
+  // 2) Host config files (may be schema-validated by Kilo; keep aliases for compatibility)
+  const hostFiles = ["kilo.json", "kilo.jsonc", path.join(".kilo", "config.json")]
+  for (const rel of hostFiles) {
+    try {
+      const parsed = await readJsonLike(path.join(directory, rel))
+      if (parsed == null) continue
+      const found = extractPluginBlock(parsed)
+      if (!found) continue
+      if (!isObject(found.block)) throw new TddError(TddErrorCode.BLOCKED, `TDD config in ${rel} (${found.key}) must be an object.`)
+      return { config: mergeConfig(DEFAULT_CONFIG, found.block as PartialConfig), source: `${rel}#${found.key}` }
+    } catch (e) {
+      if (e instanceof TddError) throw e
+      if (e instanceof SyntaxError) throw new TddError(TddErrorCode.BLOCKED, `TDD config parse error in ${rel}: ${e.message}`)
+      throw e
+    }
+  }
+
+  return { config: DEFAULT_CONFIG, source: "defaults" }
 }
+
+export async function loadConfig(directory: string): Promise<TddConfig> {
+  return (await loadConfigWithSource(directory)).config
+}
+

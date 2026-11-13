@@ -1,6 +1,7 @@
 import type { TestExecution } from "../types/cycle"
 import type { TestRunnerConfig } from "../types/config"
 import type { ParsedReport } from "./report"
+import path from "node:path"
 
 export interface RunOptions {
   cwd: string
@@ -26,31 +27,66 @@ export function matchRunner(command: string, runners?: readonly TestRunnerConfig
   return sorted.find((r) => r.match.some((m) => cmd.includes(m)))
 }
 
-function fileMentioned(out: string, file: string): boolean {
-  const base = file.split("/").pop() ?? file
+function normRel(p: string, cwd?: string): string {
+  let s = String(p || "").replace(/\\/g, "/")
+  if (cwd) {
+    const base = cwd.replace(/\\/g, "/").replace(/\/+$/, "")
+    if (s.startsWith(base + "/")) s = s.slice(base.length + 1)
+  }
+  if (!s.startsWith("/") && cwd) {
+    // keep relative
+  }
+  return s.replace(/^\.\/+/, "")
+}
+
+export function fileMentioned(out: string, file: string, cwd?: string): boolean {
+  const rel = normRel(file, cwd)
+  const base = rel.split("/").pop() ?? rel
   if (out.includes(file)) return true
+  if (rel && out.includes(rel)) return true
   if (base && out.includes(base)) return true
-  if (out.includes(file.replace(/\//g, "\\"))) return true
+  const bs = (file || "").replace(/\//g, "\\")
+  if (bs && out.includes(bs)) return true
+  const relBs = rel.replace(/\//g, "\\")
+  if (relBs && out.includes(relBs)) return true
   return false
 }
 
-function targetsMentionedAnywhere(out: string, report: ParsedReport | null, targets: string[]): { any: boolean; allMissing: boolean } {
-  if (targets.length === 0) return { any: true, allMissing: false }
-  const inOut = targets.map((t) => fileMentioned(out, t))
+function targetsMentionedAnywhere(out: string, report: ParsedReport | null, targets: string[], cwd?: string): { any: boolean; allMissing: boolean; mentioned: string[] } {
+  if (targets.length === 0) return { any: true, allMissing: false, mentioned: [] }
   const reportText = report ? report.targets.join("\n") : ""
-  const inReport = targets.map((t) => fileMentioned(reportText, t))
-  const any = targets.some((_, i) => inOut[i] || inReport[i])
-  const allMissing = targets.every((_, i) => !inOut[i] && !inReport[i])
-  return { any, allMissing }
+  const mentioned: string[] = []
+  for (const t of targets) {
+    if (fileMentioned(out, t, cwd) || (report && fileMentioned(reportText, t, cwd))) mentioned.push(t)
+  }
+  return { any: mentioned.length > 0, allMissing: mentioned.length === 0, mentioned }
+}
+
+export function collectAttributedTargets(params: {
+  cwd: string
+  verdict: boolean | null
+  targets?: string[]
+  stdout?: string
+  stderr?: string
+  report?: ParsedReport | null
+}): string[] {
+  const targets = (params.targets ?? []).filter(Boolean)
+  if (targets.length === 0) return []
+  // Only attribute GREEN-passing coverage evidence to required test files.
+  if (params.verdict !== true) return []
+  const out = `${params.stdout ?? ""}\n${params.stderr ?? ""}`
+  const { mentioned } = targetsMentionedAnywhere(out, params.report ?? null, targets, params.cwd)
+  // normalize to repo-relative strings as provided
+  return [...new Set(mentioned.map((t) => normRel(t, params.cwd)))]
 }
 
 export function classifyFromReport(
   report: ParsedReport,
-  params: { exitCode: number; targets?: string[]; stdout?: string; stderr?: string },
+  params: { exitCode: number; targets?: string[]; stdout?: string; stderr?: string; cwd?: string },
 ): { verdict: boolean | null; reason: string; skipped: boolean; hadCompileError: boolean } | null {
   const targets = (params.targets ?? []).filter(Boolean)
   const out = `${params.stdout ?? ""}\n${params.stderr ?? ""}`
-  const mention = targetsMentionedAnywhere(out, report, targets)
+  const mention = targetsMentionedAnywhere(out, report, targets, params.cwd)
   // If a report exists but shows nothing ran for explicit targets, be cautious
   if (targets.length > 0 && mention.allMissing && report.total === 0) {
     return { verdict: null, reason: `Structured ${report.format.toUpperCase()} report found but no executed tests attributable to target(s) (${targets.join(", ")}).`, skipped: true, hadCompileError: false }
@@ -84,12 +120,13 @@ export function classifyVerdict(params: {
   skipIndicator?: RegExp
   runnerId?: string
   report?: ParsedReport | null
+  cwd?: string
 }): { verdict: boolean | null; reason: string; skipped: boolean; hadCompileError: boolean } {
   const out = `${params.stdout}\n${params.stderr}`
 
   // Structured report is primary evidence when present and parseable
   if (params.report) {
-    const fromReport = classifyFromReport(params.report, { exitCode: params.exitCode, targets: params.targetTests, stdout: params.stdout, stderr: params.stderr })
+    const fromReport = classifyFromReport(params.report, { exitCode: params.exitCode, targets: params.targetTests, stdout: params.stdout, stderr: params.stderr, cwd: params.cwd })
     if (fromReport) return fromReport
   }
 
@@ -154,7 +191,8 @@ export function classifyVerdict(params: {
   }
 
   const targets = (params.targetTests ?? []).filter(Boolean)
-  const { allMissing: allTargetsMissing } = targetsMentionedAnywhere(out, null, targets)
+  const mention = targetsMentionedAnywhere(out, null, targets, params.cwd)
+  const allTargetsMissing = mention.allMissing
 
   // Node test runner structured summary (node --test): "# pass N"/"ℹ pass N", "# fail N"/"ℹ fail N", etc.
   const nodeFail = /(?:^|\n)\s*[#ℹ]\s*fail\s+(\d+)/i.exec(out)
@@ -209,9 +247,6 @@ export function classifyVerdict(params: {
     return { verdict: false, reason: `Test runner reported ${failedCount[1]} failing test(s) (valid RED).`, skipped, hadCompileError: false }
   }
   if (params.exitCode === 0 && (passedCount || /\bTests?:?\s+\d+\s+passed\b/i.test(out) || /\bPASS\b/.test(out))) {
-    if (targets.length > 0 && allTargetsMissing) {
-      return { verdict: null, reason: `Target test(s) not observed in output; cannot attribute GREEN to intended tests.`, skipped, hadCompileError: false }
-    }
     return { verdict: true, reason: "All relevant tests passed.", skipped, hadCompileError: false }
   }
 
@@ -219,9 +254,6 @@ export function classifyVerdict(params: {
     const hasFailMarker = /\b(FAIL|FAILED|✗|✘|not ok)\b/i.test(out)
     const hasPassMarker = /\b(PASS|PASSED|✓|✔|ok)\b/i.test(out) || /test(s)? passed/i.test(out)
     if (hasPassMarker && !hasFailMarker) {
-      if (targets.length > 0 && allTargetsMissing) {
-        return { verdict: null, reason: `Target test(s) not observed in output; cannot attribute GREEN to intended tests.`, skipped, hadCompileError: false }
-      }
       return { verdict: true, reason: "Command exited 0 with pass indicators and no failures.", skipped, hadCompileError: false }
     }
     return { verdict: true, reason: "Command exited 0 with no failure indicators.", skipped, hadCompileError: false }
@@ -240,7 +272,7 @@ export function classifyVerdict(params: {
     }
   }
 
-  if (targets.length > 0 && !allTargetsMissing) {
+  if (targets.length > 0 && mention.any) {
     return {
       verdict: false,
       reason: `Nonzero exit (${params.exitCode}) with target test referenced in output; treated as failing run (likely RED).`,

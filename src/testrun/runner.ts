@@ -4,7 +4,7 @@ import path from "node:path"
 import { mkdir, rm } from "node:fs/promises"
 import type { TestExecution } from "../types/cycle"
 import type { TestRunnerConfig } from "../types/config"
-import { classifyVerdict, matchRunner, type RunnerAdapter, type RunOptions } from "./adapter"
+import { classifyVerdict, collectAttributedTargets, matchRunner, type RunnerAdapter, type RunOptions } from "./adapter"
 import { readStructuredReport, type ParsedReport } from "./report"
 
 const execFileAsync = promisify(execFile)
@@ -125,11 +125,21 @@ export class GenericRunner implements RunnerAdapter {
       skipIndicator: matched?.skipIndicator,
       runnerId: matched?.id,
       report,
+      cwd: opts.cwd,
+    })
+    const attributedFiles = collectAttributedTargets({
+      cwd: opts.cwd,
+      verdict: classified.verdict,
+      targets: opts.targetTests,
+      stdout,
+      stderr,
+      report,
     })
     const tags = [matched?.id ? `runner:${matched.id}` : null, built.scoped ? "scoped" : null, report ? `report:${report.format}` : null].filter(Boolean)
     const prefix = tags.length ? `[${tags.join(",")}] ` : ""
     return {
       testFiles: opts.targetTests ?? [],
+      ...(attributedFiles.length ? { attributedFiles } : {}),
       command,
       stdout,
       stderr,

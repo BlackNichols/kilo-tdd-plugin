@@ -103,8 +103,70 @@ export function requireRedExecution(cycle: TddCycle): TestExecution {
   return ex
 }
 
+import { createClassifier } from "../classify/classifier"
+import { DEFAULT_CONFIG } from "../types/config"
+import type { TddConfig } from "../types/config"
+
+function relPath(p: string, cwd: string): string {
+  const n = p.replace(/\\/g, "/").replace(/\/+/g, "/")
+  const base = cwd.replace(/\\/g, "/").replace(/\/+$/, "") + "/"
+  if (n.startsWith(base)) return n.slice(base.length)
+  return n.replace(/^\.\/+/, "")
+}
+
+export function getRequiredRedTestFiles(cycle: TddCycle, directory: string, config: TddConfig = DEFAULT_CONFIG): string[] {
+  const classifier = createClassifier(
+    config.productionPatterns,
+    config.testPatterns,
+    config.testConfigPatterns,
+    config.excludedPatterns,
+    directory,
+  )
+  const files = Object.keys(cycle.redCommit?.files ?? {})
+  return files.filter((f) => !f.endsWith("/") && classifier.isTest(path.isAbsolute(f) ? f : path.join(directory, f)))
+}
+
+export function getCoveredRedTestFiles(cycle: TddCycle, directory: string, config: TddConfig = DEFAULT_CONFIG): string[] {
+  const required = new Set(getRequiredRedTestFiles(cycle, directory, config))
+  const covered = new Set<string>()
+  for (const ex of cycle.greenExecutions ?? []) {
+    if (ex.verdict !== true) continue
+    const evidenced = (ex.attributedFiles && ex.attributedFiles.length > 0) ? ex.attributedFiles : []
+    for (const tf of evidenced) {
+      const rel = relPath(tf, directory)
+      if (required.has(rel)) covered.add(rel)
+      if (required.has(tf)) covered.add(tf)
+    }
+  }
+  return [...covered]
+}
+
+export function requireFullGreenCoverage(cycle: TddCycle, directory: string, config: TddConfig = DEFAULT_CONFIG): void {
+  const required = getRequiredRedTestFiles(cycle, directory, config)
+  if (required.length === 0) {
+    // fallback to legacy: need at least one green
+    const anyGreen = (cycle.greenExecutions ?? []).some((e) => e.verdict === true)
+    if (!anyGreen) throw new TddError(TddErrorCode.NOT_GREEN, "TDD enforcement: GREEN has not been verified. Run tdd_verify_green first.")
+    return
+  }
+  const covered = new Set(getCoveredRedTestFiles(cycle, directory, config))
+  const missing = required.filter((f) => !covered.has(f))
+  const anyGreen = (cycle.greenExecutions ?? []).some((e) => e.verdict === true)
+  if (!anyGreen) {
+    throw new TddError(TddErrorCode.NOT_GREEN, "TDD enforcement: GREEN has not been verified. Run tdd_verify_green first.")
+  }
+  if (missing.length > 0) {
+    throw new TddError(
+      TddErrorCode.NOT_GREEN,
+      `TDD enforcement: Not all RED test files are verified GREEN. Missing coverage for: ${missing.join(", ")}. ` +
+        `Run tdd_verify_green for each remaining test scope/command so all protected RED tests are covered.`,
+      { missing },
+    )
+  }
+}
+
 export function requireGreenExecution(cycle: TddCycle): TestExecution {
-  const ex = cycle.greenExecution
+  const ex = (cycle.greenExecutions ?? []).find((e) => e.verdict === true)
   if (!ex) {
     throw new TddError(
       TddErrorCode.NO_RECENT_EXECUTION,

@@ -29,8 +29,13 @@ export type TddState = (typeof TddState)[keyof typeof TddState]
  * pass it never observed.
  */
 export interface TestExecution {
-  /** Absolute path to the test file(s) that were executed. */
+  /** Test file path(s) requested/scoped for this run. */
   readonly testFiles: readonly string[]
+  /**
+   * Required RED test files (repo-relative) proven exercised/passed by this run.
+   * Used for GREEN coverage attribution; may be a subset of requested targets.
+   */
+  readonly attributedFiles?: readonly string[]
   /** Command that was run, e.g. `vitest run src/foo.test.ts`. */
   readonly command: string
   /** Raw stdout captured from the run. */
@@ -80,6 +85,20 @@ export interface Checkpoint {
 }
 
 /**
+ * Snapshot of implementation work captured before `tdd_revert_implementation`.
+ * Stored as a detached git commit so it can be restored with 3-way apply.
+ */
+export interface ImplSnapshot {
+  readonly id: string
+  readonly sha: string
+  readonly shortSha: string
+  readonly baseSha: string
+  readonly files: readonly string[]
+  readonly createdAt: number
+  readonly reason: "revert"
+}
+
+/**
  * Full record of an active or completed TDD cycle.
  *
  * Persisted to `.kilo/tdd/cycles/<id>.json` so the state survives across
@@ -100,8 +119,11 @@ export interface TddCycle {
   redCommit: Checkpoint | null
   /** Latest verified RED execution. */
   redExecution: TestExecution | null
-  /** Latest verified GREEN execution. */
-  greenExecution: TestExecution | null
+  /**
+   * Verified GREEN executions for the current implementation against the RED baseline.
+   * Multiple commands may be recorded (e.g. unit + e2e) to cover all required RED test files.
+   */
+  greenExecutions: TestExecution[]
   /** Whether the refactoring review has been explicitly declared complete. */
   refactorReviewDone: boolean
   /** Whether the refactoring review declared no refactoring necessary. */
@@ -114,6 +136,8 @@ export interface TddCycle {
   amendCount: number
   /** Number of implementation reverts performed during this cycle. */
   revertCount: number
+  /** Detached-commit snapshots of reverted implementation (restorable). */
+  implSnapshots: ImplSnapshot[]
   /** Full audit log of plugin actions. Mutated in place by the store. */
   log: TddLogEntry[]
   /** Human-readable report generated at COMPLETE. */

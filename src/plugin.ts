@@ -2,12 +2,12 @@ import type { Plugin } from "@kilocode/plugin"
 import { CycleStore } from "./store/store"
 import { createTools } from "./tools/tdd"
 import { enforceBeforeTool } from "./enforce/hooks"
-import { loadConfig } from "./types/load-config"
+import { loadConfigWithSource } from "./types/load-config"
 
 const plugin: Plugin = async (input) => {
-  const config = await loadConfig(input.directory)
+  const { config, source } = await loadConfigWithSource(input.directory)
   const store = new CycleStore(input.directory)
-  const tools = createTools(store, input.directory, config)
+  const tools = createTools(store, input.directory, config, source)
 
   return {
     tool: {

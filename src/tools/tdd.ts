@@ -4,11 +4,11 @@ import { CycleStore } from "../store/store"
 import { TddState, type TddCycle } from "../types/cycle"
 import { TddError, TddErrorCode } from "../types/errors"
 import { DEFAULT_CONFIG } from "../types/config"
-import { makeCheckpoint, requireRedExecution, verifyProtectedTests } from "../enforce/checks"
+import { makeCheckpoint, requireRedExecution, requireFullGreenCoverage, verifyProtectedTests, getRequiredRedTestFiles, getCoveredRedTestFiles } from "../enforce/checks"
 import { runTest } from "../testrun/runner"
 import { createClassifier } from "../classify/classifier"
 
-export function createTools(store: CycleStore, directory: string, config = DEFAULT_CONFIG) {
+export function createTools(store: CycleStore, directory: string, config = DEFAULT_CONFIG, configSource = "defaults") {
   const git = new GitClient(directory)
   const classifier = createClassifier(
     config.productionPatterns,
@@ -46,7 +46,7 @@ export function createTools(store: CycleStore, directory: string, config = DEFAU
         store.appendLog(cycle, { at: Date.now(), state: cycle.state, tool: "tdd_start", action: "start", ok: true, detail: `Started cycle for: ${args.behavior}` })
         await store.save(cycle)
         await store.setActive(context.sessionID, cycle)
-        return `TDD cycle started.\n- id: ${cycle.id}\n- state: ${cycle.state}\n- branch: ${branch}\n- base: ${baseSha.slice(0, 7)}\n- behavior: ${args.behavior}\n\nNext: write a failing test, run it, then call tdd_commit_red.`
+        return `TDD cycle started.\n- id: ${cycle.id}\n- state: ${cycle.state}\n- branch: ${branch}\n- base: ${baseSha.slice(0, 7)}\n- behavior: ${args.behavior}\n- config: ${configSource}\n\nNext: write a failing test, run it, then call tdd_commit_red.`
       })
     },
   })
@@ -56,9 +56,13 @@ export function createTools(store: CycleStore, directory: string, config = DEFAU
     args: {},
     async execute(_args, context) {
       const cycle = await store.getActive(context.sessionID)
-      if (!cycle) return "No active TDD cycle. Use tdd_start to begin."
+      if (!cycle) return `No active TDD cycle. Use tdd_start to begin.\n- config: ${configSource}`
       const protectedFiles = Object.keys(cycle.redCommit?.files ?? {})
-      const req = remainingRequirements(cycle)
+      const requiredRedTests = getRequiredRedTestFiles(cycle, directory, config)
+      const coveredRedTests = getCoveredRedTestFiles(cycle, directory, config)
+      const missingRedTests = requiredRedTests.filter((f) => !coveredRedTests.includes(f))
+      const req = remainingRequirements(cycle, missingRedTests)
+      const greenRuns = cycle.greenExecutions ?? []
       return [
         `TDD Status`,
         `- cycle: ${cycle.id}`,
@@ -66,11 +70,16 @@ export function createTools(store: CycleStore, directory: string, config = DEFAU
         `- branch: ${cycle.branch}`,
         `- base: ${cycle.baseSha.slice(0, 7)}`,
         `- behavior: ${(cycle as any).behavior ?? "(unknown)"}`,
+        `- config: ${configSource}`,
         `- RED commit: ${cycle.redCommit?.shortSha ?? "none"}`,
         `- GREEN commit: ${cycle.greenCommit?.shortSha ?? "none"}`,
         `- protected tests: ${protectedFiles.length ? protectedFiles.join(", ") : "none"}`,
+        `- required RED tests: ${requiredRedTests.length ? requiredRedTests.join(", ") : "none"}`,
+        `- GREEN-covered RED tests: ${coveredRedTests.length ? coveredRedTests.join(", ") : "none"}`,
+        `- missing GREEN coverage: ${missingRedTests.length ? missingRedTests.join(", ") : "none"}`,
+        `- impl snapshots: ${(cycle.implSnapshots ?? []).length ? (cycle.implSnapshots ?? []).map((s) => `${s.id}:${s.shortSha}`).join(", ") : "none"}`,
         `- red execution: ${cycle.redExecution ? `${cycle.redExecution.verdict === false ? "RED(valid)" : cycle.redExecution.verdict === true ? "PASS" : "AMBIGUOUS"} - ${cycle.redExecution.verdictReason}` : "none"}`,
-        `- green execution: ${cycle.greenExecution ? `${cycle.greenExecution.verdict === true ? "GREEN(valid)" : "NOT GREEN"} - ${cycle.greenExecution.verdictReason}` : "none"}`,
+        `- green executions: ${greenRuns.length ? greenRuns.map((e) => `${e.verdict === true ? "GREEN" : "NOT_GREEN"}(${e.command})`).join(" | ") : "none"}`,
         `- refactor review: ${cycle.refactorReviewDone ? (cycle.refactorReviewNoOp ? "done (no refactor)" : "done") : "pending"}`,
         `- amendments: ${cycle.amendCount}, reverts: ${cycle.revertCount}`,
         `- remaining: ${req.join("; ") || "none"}`,
@@ -144,6 +153,25 @@ export function createTools(store: CycleStore, directory: string, config = DEFAU
         const stagedChanged = (await git.stagedAll()).filter((f) => !protectedFiles.has(f) && !classifier.isExcluded(pathJoin(directory, f)))
         const untracked = (await git.untrackedFiles()).filter((f) => !protectedFiles.has(f) && !classifier.isExcluded(pathJoin(directory, f)))
         const restoreSet = [...new Set([...trackedChanged, ...stagedChanged])]
+        const snapshotFiles = [...new Set([...restoreSet, ...untracked])]
+
+        let snapshot: { sha: string; shortSha: string } | null = null
+        if (snapshotFiles.length > 0) {
+          const snapSha = await git.createDetachedSnapshot("HEAD", snapshotFiles, `tdd-snapshot: ${cycle.id} revert ${cycle.revertCount + 1}`)
+          if (snapSha) {
+            snapshot = { sha: snapSha, shortSha: await git.shortSha(snapSha) }
+            if (!cycle.implSnapshots) cycle.implSnapshots = []
+            cycle.implSnapshots.push({
+              id: String(cycle.implSnapshots.length + 1),
+              sha: snapSha,
+              shortSha: snapshot.shortSha,
+              baseSha: cycle.redCommit.sha,
+              files: snapshotFiles,
+              createdAt: Date.now(),
+              reason: "revert",
+            })
+          }
+        }
 
         if (restoreSet.length > 0) await git.restoreFrom(cycle.redCommit.sha, restoreSet)
         // unstage anything left that's not protected
@@ -156,10 +184,46 @@ export function createTools(store: CycleStore, directory: string, config = DEFAU
         }
 
         cycle.revertCount++
+        cycle.greenExecutions = []
         cycle.state = TddState.TEST_CORRECTION
-        store.appendLog(cycle, { at: Date.now(), state: cycle.state, tool: "tdd_revert_implementation", action: "revert", ok: true, detail: `Reverted: ${restoreSet.join(", ")}; removed untracked: ${untracked.join(", ")}` })
+        store.appendLog(cycle, { at: Date.now(), state: cycle.state, tool: "tdd_revert_implementation", action: "revert", ok: true, detail: `Snapshot: ${snapshot?.shortSha ?? "none"}; reverted: ${restoreSet.join(", ")}; removed untracked: ${untracked.join(", ")}` })
         await store.save(cycle)
-        return `Implementation reverted.\nRestored: ${restoreSet.join(", ") || "(none)"}\nRemoved untracked: ${untracked.join(", ") || "(none)"}\nState: ${cycle.state}\n\nNext: correct the test, run it to confirm RED, then call tdd_amend_red.`
+        return `Implementation reverted.\nSnapshot: ${snapshot ? `${snapshot.shortSha} (${snapshot.sha})` : "(none - no implementation changes detected)"}\nRestored: ${restoreSet.join(", ") || "(none)"}\nRemoved untracked: ${untracked.join(", ") || "(none)"}\nState: ${cycle.state}\n\nNext: correct the test, run it to confirm RED, then call tdd_amend_red. After amend, you can restore saved implementation with tdd_restore_implementation.`
+      })
+    },
+  })
+
+  const tdd_restore_implementation = tool({
+    description: "Restore implementation from a detached-commit snapshot created by tdd_revert_implementation. Only allowed in IMPLEMENTATION state (after test correction/amend). Uses 3-way apply; on conflict the restore is aborted and the snapshot remains available.",
+    args: {
+      snapshotId: tool.schema.string().optional().describe("Snapshot id to restore (defaults to latest)."),
+    },
+    async execute(args, context) {
+      return store.withLock(context.sessionID, async () => {
+        const cycle = store.requireActive(await store.getActive(context.sessionID))
+        store.requireState(cycle, [TddState.IMPLEMENTATION, TddState.GREEN_VERIFICATION], "tdd_restore_implementation")
+        await verifyProtectedTests(git, cycle)
+        const snaps = cycle.implSnapshots ?? []
+        if (snaps.length === 0) throw new TddError(TddErrorCode.NOT_FOUND, "TDD enforcement: No implementation snapshot available to restore.")
+        const snap = args.snapshotId ? snaps.find((s) => s.id === args.snapshotId || s.shortSha === args.snapshotId || s.sha === args.snapshotId) : snaps[snaps.length - 1]
+        if (!snap) throw new TddError(TddErrorCode.NOT_FOUND, `TDD enforcement: Snapshot "${args.snapshotId}" not found. Available: ${snaps.map((s) => `${s.id}:${s.shortSha}`).join(", ")}`)
+        const blob = await git.run(["cat-file", "-t", snap.sha])
+        if (blob.exitCode !== 0 || blob.stdout.trim() !== "commit") {
+          throw new TddError(TddErrorCode.PERSISTENCE_ERROR, `TDD enforcement: Snapshot commit ${snap.shortSha} no longer exists; cannot restore.`)
+        }
+        const applied = await git.applyCommit3Way(snap.sha)
+        if (!applied.ok) {
+          store.appendLog(cycle, { at: Date.now(), state: cycle.state, tool: "tdd_restore_implementation", action: "restore", ok: false, detail: `Conflict/failed applying ${snap.shortSha}: ${applied.output}` })
+          await store.save(cycle)
+          throw new TddError(
+            TddErrorCode.BLOCKED,
+            `TDD enforcement: Could not restore snapshot ${snap.shortSha} cleanly (3-way apply conflict/failure). Snapshot remains available for manual recovery.\n${applied.output || ""}`.trim(),
+            { snapshot: snap.shortSha, conflicts: applied.conflicts },
+          )
+        }
+        store.appendLog(cycle, { at: Date.now(), state: cycle.state, tool: "tdd_restore_implementation", action: "restore", ok: true, detail: `Restored snapshot ${snap.shortSha}` })
+        await store.save(cycle)
+        return `Implementation restored from snapshot ${snap.shortSha} (${snap.sha}).\nFiles: ${snap.files.join(", ") || "(unknown)"}\n\nReview restored changes, adjust if needed for the amended test, then call tdd_verify_green.`
       })
     },
   })
@@ -203,6 +267,7 @@ export function createTools(store: CycleStore, directory: string, config = DEFAU
         const amendedFiles = await git.filesInCommit(sha)
         cycle.redCommit = await makeCheckpoint(git, sha, msg, amendedFiles)
         cycle.amendCount++
+        cycle.greenExecutions = []
         cycle.state = TddState.IMPLEMENTATION
         store.appendLog(cycle, { at: Date.now(), state: cycle.state, tool: "tdd_amend_red", action: "amend", ok: true, detail: `Amended RED to ${sha.slice(0, 7)}` })
         await store.save(cycle)
@@ -222,15 +287,61 @@ export function createTools(store: CycleStore, directory: string, config = DEFAU
         const cycle = store.requireActive(await store.getActive(context.sessionID))
         store.requireState(cycle, [TddState.IMPLEMENTATION, TddState.GREEN_VERIFICATION, TddState.REFACTOR_REVIEW], "tdd_verify_green")
         await verifyProtectedTests(git, cycle)
+        const requiredRedTests = getRequiredRedTestFiles(cycle, directory, config)
         const protectedTests = Object.keys(cycle.redCommit?.files ?? {})
-        const targetTests = normalizeTargets(args.testFiles, protectedTests, directory)
+        const fallbackTargets = requiredRedTests.length ? requiredRedTests : protectedTests
+        let targetTests: string[]
+        let explicitScope = false
+        if (args.testFiles && args.testFiles.length > 0) {
+          targetTests = normalizeTargets(args.testFiles, fallbackTargets, directory)
+          explicitScope = true
+        } else {
+          const mentioned = fallbackTargets.filter((f) => commandMentionsFile(args.command, f, directory))
+          if (mentioned.length > 0) {
+            targetTests = normalizeTargets(mentioned, fallbackTargets, directory)
+            explicitScope = mentioned.length < fallbackTargets.length || mentioned.length === 1
+          } else {
+            targetTests = normalizeTargets(fallbackTargets, fallbackTargets, directory)
+            explicitScope = false
+          }
+        }
         const exec = await runTest({ cwd: directory, command: args.command, targetTests, runners: config.testRunners })
-        cycle.greenExecution = exec
+        const relDir = directory.replace(/\\/g, "/").replace(/\/+$/, "")
+        const toRel = (f: string) => {
+          let s = f.replace(/\\/g, "/")
+          if (s.startsWith(relDir + "/")) s = s.slice(relDir.length + 1)
+          return s.replace(/^\.\/+/, "")
+        }
+        const attributedNow = new Set((exec.attributedFiles ?? []).map(toRel))
+        // allow scoped runs to attribute their intended targets when verdict is unambiguously GREEN
+        if (exec.verdict === true && explicitScope) {
+          for (const t of targetTests) {
+            const rel = toRel(t)
+            if (requiredRedTests.includes(rel)) attributedNow.add(rel)
+          }
+          ;(exec as any).attributedFiles = [...attributedNow]
+        }
+        const intendedRequired = requiredRedTests.filter((f) => targetTests.some((t) => toRel(t) === f || t.endsWith("/" + f) || t === f))
+        const missingAttributed = intendedRequired.filter((f) => !attributedNow.has(f))
+        if (exec.verdict === true && missingAttributed.length > 0) {
+          // fail closed: green run cannot prove coverage for intended required targets
+          execVerdictOverride(exec, null, `${exec.verdictReason} Cannot attribute GREEN coverage to required test(s): ${missingAttributed.join(", ")}. Provide explicit testFiles/structured report or a scoped command whose output references them.`)
+        }
+        if (!cycle.greenExecutions) cycle.greenExecutions = []
+        cycle.greenExecutions.push(exec)
         if (exec.verdict === true) {
+          const covered = getCoveredRedTestFiles(cycle, directory, config)
+          const missing = requiredRedTests.filter((f) => !covered.includes(f))
+          if (missing.length > 0) {
+            cycle.state = TddState.GREEN_VERIFICATION
+            store.appendLog(cycle, { at: Date.now(), state: cycle.state, tool: "tdd_verify_green", action: "green-partial", ok: true, detail: `${exec.verdictReason}; missing coverage: ${missing.join(", ")}` })
+            await store.save(cycle)
+            return `GREEN verified for this command.\n${exec.verdictReason}\nCovered RED tests: ${covered.join(", ") || "(none)"}\nMissing RED tests: ${missing.join(", ")}\nState: ${cycle.state}\n\nRun tdd_verify_green for remaining test scopes/commands until all RED tests are covered, then review refactoring and call tdd_commit_green.`
+          }
           cycle.state = TddState.REFACTOR_REVIEW
           store.appendLog(cycle, { at: Date.now(), state: cycle.state, tool: "tdd_verify_green", action: "green", ok: true, detail: exec.verdictReason })
           await store.save(cycle)
-          return `GREEN verified.\n${exec.verdictReason}\nState: ${cycle.state}\n\nNext: review refactoring. Call tdd_commit_green with refactor notes when ready.`
+          return `GREEN verified for all required RED tests.\n${exec.verdictReason}\nCovered RED tests: ${covered.join(", ") || "(none)"}\nState: ${cycle.state}\n\nNext: review refactoring. Call tdd_commit_green with refactor notes when ready.`
         }
         cycle.state = TddState.IMPLEMENTATION
         store.appendLog(cycle, { at: Date.now(), state: cycle.state, tool: "tdd_verify_green", action: "green-fail", ok: false, detail: exec.verdictReason })
@@ -252,9 +363,7 @@ export function createTools(store: CycleStore, directory: string, config = DEFAU
         const cycle = store.requireActive(await store.getActive(context.sessionID))
         store.requireState(cycle, [TddState.REFACTOR_REVIEW, TddState.IMPLEMENTATION], "tdd_commit_green")
         await verifyProtectedTests(git, cycle)
-        if (!cycle.greenExecution || cycle.greenExecution.verdict !== true) {
-          throw new TddError(TddErrorCode.NOT_GREEN, "TDD enforcement: GREEN has not been verified. Run tdd_verify_green first.")
-        }
+        requireFullGreenCoverage(cycle, directory, config)
         cycle.refactorReviewDone = true
         cycle.refactorReviewNoOp = args.refactor === "no"
         cycle.refactorNotes = args.notes ?? null
@@ -318,7 +427,7 @@ export function createTools(store: CycleStore, directory: string, config = DEFAU
           amendments: cycle.amendCount,
           reverts: cycle.revertCount,
           redVerdict: cycle.redExecution?.verdictReason ?? "n/a",
-          greenVerdict: cycle.greenExecution?.verdictReason ?? "n/a",
+          greenVerdict: (cycle.greenExecutions ?? []).filter((e) => e.verdict === true).map((e) => e.verdictReason).join(" | ") || "n/a",
           refactorDecision: cycle.refactorReviewNoOp ? "no refactoring needed" : "refactored",
           summary: `RED ${cycle.redCommit?.shortSha ?? "?"} -> GREEN ${cycle.greenCommit?.shortSha ?? "?"}`,
         }
@@ -341,7 +450,7 @@ export function createTools(store: CycleStore, directory: string, config = DEFAU
     },
   })
 
-  return { tdd_start, tdd_status, tdd_commit_red, tdd_revert_implementation, tdd_amend_red, tdd_verify_green, tdd_commit_green, tdd_finish }
+  return { tdd_start, tdd_status, tdd_commit_red, tdd_revert_implementation, tdd_restore_implementation, tdd_amend_red, tdd_verify_green, tdd_commit_green, tdd_finish }
 }
 
 
@@ -359,13 +468,13 @@ function normalizeTargets(provided: string[] | undefined, fallback: string[], ba
   return [...new Set(out)]
 }
 
-function remainingRequirements(cycle: TddCycle): string[] {
+function remainingRequirements(cycle: TddCycle, missingGreen: string[] = []): string[] {
   const req: string[] = []
   switch (cycle.state) {
     case TddState.RED_TEST: req.push("Write failing test, run it, call tdd_commit_red"); break
-    case TddState.IMPLEMENTATION: req.push("Implement behavior, call tdd_verify_green"); break
+    case TddState.IMPLEMENTATION: req.push("Implement behavior, call tdd_verify_green for all RED tests"); break
     case TddState.TEST_CORRECTION: req.push("Correct test, run RED, call tdd_amend_red"); break
-    case TddState.GREEN_VERIFICATION: req.push("Run tdd_verify_green"); break
+    case TddState.GREEN_VERIFICATION: req.push(missingGreen.length ? `Run tdd_verify_green for missing RED tests: ${missingGreen.join(", ")}` : "Run tdd_verify_green for remaining RED tests"); break
     case TddState.REFACTOR_REVIEW: req.push("Review refactoring, call tdd_commit_green"); break
     case TddState.GREEN_COMMIT: req.push("Call tdd_commit_green"); break
     case TddState.COMPLETE: req.push("Call tdd_finish"); break
@@ -373,7 +482,22 @@ function remainingRequirements(cycle: TddCycle): string[] {
   return req
 }
 
+function execVerdictOverride(exec: any, verdict: boolean | null, reason: string) {
+  exec.verdict = verdict
+  exec.verdictReason = reason
+}
+
 function pathJoin(base: string, p: string): string {
   if (p.startsWith("/")) return p
   return `${base}/${p}`.replace(/\/+/g, "/")
+}
+
+function commandMentionsFile(command: string, file: string, baseDir: string): boolean {
+  const rel = file.replace(/\\/g, "/").replace(/^\.\/+/, "")
+  if (command.includes(rel)) return true
+  const abs = rel.startsWith("/") ? rel : pathJoin(baseDir, rel)
+  if (command.includes(abs)) return true
+  const base = rel.split("/").pop() ?? rel
+  if (base && command.includes(base)) return true
+  return false
 }

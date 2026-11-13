@@ -38,6 +38,6 @@ describe("target scoping", () => {
     await writeFile(path.join(repo.dir, "src", "x.js"), "export function x(){return 1}\n")
     await h.callTool("tdd_verify_green", { command: "node --test tests/x.test.js" })
     const cycle = await h.store.getActive(h.sessionID)
-    expect(cycle?.greenExecution?.testFiles?.length).toBeGreaterThan(0)
+    expect(cycle?.greenExecutions?.[0]?.testFiles?.length).toBeGreaterThan(0)
   })
 })

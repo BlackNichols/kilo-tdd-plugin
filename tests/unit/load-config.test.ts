@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest"
 import { mkdtemp, writeFile, rm, mkdir } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { loadConfig, mergeConfig } from "../../src/types/load-config"
+import { loadConfig, loadConfigWithSource, mergeConfig } from "../../src/types/load-config"
 import { DEFAULT_CONFIG } from "../../src/types/config"
 import { TddError } from "../../src/types/errors"
 
@@ -39,6 +39,30 @@ describe("loadConfig / mergeConfig", () => {
     await writeFile(path.join(dir, ".kilo", "config.json"), JSON.stringify({ tdd: { productionPatterns: ["app/**"] } }))
     const cfg = await loadConfig(dir)
     expect(cfg.productionPatterns).toEqual(["app/**"])
+  })
+
+  it("loads plugin-owned .kilo/tdd.json and reports source", async () => {
+    await mkdir(path.join(dir, ".kilo"), { recursive: true })
+    await writeFile(path.join(dir, ".kilo", "tdd.json"), JSON.stringify({ excludedPatterns: ["my-artifacts/**"] }))
+    const loaded = await loadConfigWithSource(dir)
+    expect(loaded.config.excludedPatterns).toEqual(["my-artifacts/**"])
+    expect(loaded.source).toBe(path.join(".kilo", "tdd.json"))
+  })
+
+  it("loads plugin-owned kilo.tdd.json", async () => {
+    await writeFile(path.join(dir, "kilo.tdd.json"), JSON.stringify({ strictness: "lenient" }))
+    const loaded = await loadConfigWithSource(dir)
+    expect(loaded.config.strictness).toBe("lenient")
+    expect(loaded.source).toBe("kilo.tdd.json")
+  })
+
+  it("prefers plugin-owned config over host config block", async () => {
+    await mkdir(path.join(dir, ".kilo"), { recursive: true })
+    await writeFile(path.join(dir, ".kilo", "tdd.json"), JSON.stringify({ strictness: "lenient" }))
+    await writeFile(path.join(dir, "kilo.json"), JSON.stringify({ tdd: { strictness: "strict" } }))
+    const loaded = await loadConfigWithSource(dir)
+    expect(loaded.config.strictness).toBe("lenient")
+    expect(loaded.source).toBe(path.join(".kilo", "tdd.json"))
   })
 
   it("throws on invalid config types", async () => {

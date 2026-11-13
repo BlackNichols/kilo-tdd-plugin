@@ -28,11 +28,13 @@ Core modules:
 4. `tdd_commit_green {refactor: "yes"|"no", notes?}` — commits verified implementation files (non-protected test/config changes rejected for scope safety).
 5. `tdd_finish` — generates report and clears active cycle.
 
-**Correction:** `tdd_revert_implementation` (restores tracked impl from RED commit, removes untracked impl, explicit paths) → fix test → run → `tdd_amend_red` (re-verifies RED, amends RED commit, refreshes baseline).
+**Correction:** `tdd_revert_implementation` snapshots current implementation as a detached git commit (no stash; safe across worktrees), then restores tracked impl from RED commit, removes untracked impl, and moves to `TEST_CORRECTION`. After `tdd_amend_red`, restore prior implementation with `tdd_restore_implementation` (3-way apply; on conflict the restore is aborted and the snapshot remains for manual recovery). Then fix test → run → `tdd_amend_red` (re-verifies RED, amends RED commit, refreshes baseline).
 
 ## Configuration
 
-Loaded at plugin init (first found): `kilo.json`, `kilo.jsonc`, `.kilo/config.json`. Plugin-specific settings are read from `tdd`, `pluginConfig["kilo-tdd-plugin"]`, or `"kilo-tdd-plugin"` keys and merged over defaults.
+Configuration is loaded at plugin init. **Preferred (plugin-owned, host-schema-safe):** `.kilo/tdd.json` (also `.kilo/tdd/config.json` or `kilo.tdd.json`). The plugin also reads from host config files when present: `kilo.json`, `kilo.jsonc`, `.kilo/config.json` using keys `tdd`, `pluginConfig["kilo-tdd-plugin"]`, or `"kilo-tdd-plugin"`. Plugin-owned files take precedence. Use a plugin-owned file if your Kilo host rejects unknown keys in `kilo.json` (e.g. `Unrecognized key: tdd`).
+
+`tdd_status` / `tdd_start` report the effective config source.
 
 Supported overrides (validated, fail-closed on unknown keys/invalid types): `productionPatterns`, `testPatterns`, `testConfigPatterns`, `excludedPatterns`, `commitMessages` (`red`/`green`/`refactor`), `worktreeEnabled`, `refactorMandatory`, `logLevel`, `strictness`, `allowNonProtectedTestConfigInGreenCommit` (default `false`), and `testRunners` (override/inherit by `id`: `match`, `command`, `skipIndicator` regex string, `scopeArgs` prefix tokens; custom runners append target files by default).
 
@@ -71,8 +73,9 @@ npm test            # vitest run (unit + integration)
 - **Shell write bypass residual risk (API dead-end for OS prevention):** `shell.env` cannot block commands and there are no filesystem/sandbox hooks. Parseable targets and many opaque/programmatic-write patterns are blocked/fail-closed pre-exec, but novel constructs or non-intercepted execution paths may evade detection; guaranteed prevention requires external sandboxing.
 - **Patch formats:** extraction is best-effort for common formats; unknown formats without parseable targets are refused, but complex multi-file/custom formats could require further hardening.
 - **Test verdicts:** heuristic but hardened (stdout/stderr/exit; node `#`/`ℹ`, TAP, JUnit/XML-ish summaries, and vitest/jest/pytest-style counts; skip/pending/todo/no-tests/infra/compile detection; missing-module-as-RED; runner match/skip-indicator hints/annotation). `tdd_*` test tools accept/infer `testFiles` for attribution and fail closed when specified targets cannot be attributed without strong structured evidence. Runner-driven command building/scoping and full JSON report ingestion are not automated yet.
+- **GREEN verification scope:** `tdd_verify_green` accumulates verified runs and `tdd_commit_green` requires GREEN coverage for every required RED test file (test-classified files in the RED baseline). Lint/build/full-suite gates outside that scope remain the caller/project’s responsibility. Post-finish fixes are outside the cycle.
 - **Worktrees:** `worktreeEnabled` isolation not implemented; `true` is rejected fail-closed.
-- **Config:** partial loader/merge only; no schema validation; `testRunners` not configurable.
+- **Config:** loaded from plugin-owned `.kilo/tdd.json` (preferred), `.kilo/tdd/config.json`, `kilo.tdd.json`, or host `kilo.json`/`kilo.jsonc`/`.kilo/config.json` blocks; validated/merged. Host `kilo.json` may reject unknown plugin keys depending on schema—use plugin-owned files. `tdd_status` reports effective source.
 - **GREEN commit scope:** conservative by default (rejects non-protected test/config changes in dirty set; stages implementation files excluding protected tests). Configurable via `allowNonProtectedTestConfigInGreenCommit`; atypical repos may still need pattern tuning.
 - **RED commits are baseline snapshots of all dirty, non-excluded files:** `tdd_commit_red` / `tdd_amend_red` stage the full dirty set (not only intended test files) and record committed files as the protected RED baseline. Generated artifacts (e.g. Playwright `test-results/`, reports) should be excluded via `excludedPatterns` and kept out of the working tree before RED/amend, otherwise they become protected and hard to normalize in-cycle. Defaults exclude `test-results/**`, `playwright-report/**`, and `blob-report/**`; override `excludedPatterns` if your runner writes artifacts elsewhere.
 

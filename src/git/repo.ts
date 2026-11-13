@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process"
 import { createHash } from "node:crypto"
-import { readFile } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import os from "node:os"
 import path from "node:path"
 import { promisify } from "node:util"
 
@@ -181,6 +182,48 @@ export class GitClient {
       if (blob) out[f] = blob
     }
     return out
+  }
+
+  /**
+   * Create a detached commit snapshotting the given files against `baseSha`'s tree,
+   * without touching HEAD, the index, or the working tree. Returns the snapshot SHA.
+   */
+  async createDetachedSnapshot(baseSha: string, files: string[], message: string): Promise<string | null> {
+    if (files.length === 0) return null
+    const tmpIndex = path.join(await mkdtemp(path.join(os.tmpdir(), "kilo-tdd-index-")), "index")
+    const env = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_INDEX_FILE: tmpIndex }
+    try {
+      await execFileAsync("git", ["read-tree", baseSha], { cwd: this.cwd, env, maxBuffer: 10 * 1024 * 1024 })
+      await execFileAsync("git", ["add", "-A", "--", ...files], { cwd: this.cwd, env, maxBuffer: 10 * 1024 * 1024 })
+      const tree = (await execFileAsync("git", ["write-tree"], { cwd: this.cwd, env, maxBuffer: 10 * 1024 * 1024 })).stdout.toString().trim()
+      const parent = (await this.run(["rev-parse", "--verify", "-q", baseSha])).stdout.trim() || baseSha
+      const sha = (await execFileAsync("git", ["commit-tree", tree, "-p", parent, "-m", message], { cwd: this.cwd, env, maxBuffer: 10 * 1024 * 1024 })).stdout.toString().trim()
+      return sha
+    } finally {
+      await rm(path.dirname(tmpIndex), { recursive: true, force: true })
+    }
+  }
+
+  async applyCommit3Way(sha: string): Promise<{ ok: boolean; conflicts: string[]; output: string }> {
+    const res = await this.run(["cherry-pick", "--no-commit", "--allow-empty", "-X", "theirs", sha])
+    const status = (await this.run(["status", "--porcelain"])).stdout
+    const conflicts = status
+      .split("\n")
+      .map((l) => l.trimEnd())
+      .filter((l) => /^(UU|AA|DD|AU|UA|DU|UD)/.test(l))
+      .map((l) => l.slice(3).trim())
+      .filter(Boolean)
+    if (res.exitCode === 0 && conflicts.length === 0) {
+      // leave applied changes staged/unstaged as git did; caller decides next step (we'll reset index via read-tree behavior not needed)
+      // but --no-commit leaves index updated; unstage to behave like "restored files" in working tree?
+      await this.run(["reset"])
+      return { ok: true, conflicts: [], output: (res.stdout + res.stderr).trim() }
+    }
+    // on conflict, abort cherry-pick state but keep conflict markers? no: --abort would drop; better keep state for manual resolution.
+    // safer: abort and report failure so user can decide; detached commit still exists.
+    const out = (res.stdout + res.stderr).trim()
+    await this.run(["cherry-pick", "--abort"])
+    return { ok: false, conflicts, output: out }
   }
 }
 
