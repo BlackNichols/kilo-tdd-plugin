@@ -1,6 +1,6 @@
 {
   "name": "kilo-tdd-plugin",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "description": "Git-backed TDD enforcement plugin for Kilo Code. Drives a RED → commit → implementation → GREEN → commit state machine enforced through Git checkpoints.",
   "type": "module",
   "main": "src/plugin.ts",

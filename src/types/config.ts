@@ -150,7 +150,9 @@ export const DEFAULT_CONFIG: TddConfig = {
       id: "npm",
       match: ["npm test"],
       scopeArgs: () => [],
-      reportFormat: "auto",
+      // No default report injection: npm scripts are wrappers and underlying runner/flags vary.
+      // Configure runner.reportArgs explicitly if structured report output is known-safe.
+      reportFormat: undefined,
       skipIndicator: /skip|passing.*failing/i,
     },
   ],

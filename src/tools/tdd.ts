@@ -1,4 +1,7 @@
 import { tool } from "@kilocode/plugin"
+import { readFile } from "node:fs/promises"
+import path from "node:path"
+import { fileURLToPath } from "node:url"
 import { GitClient } from "../git/repo"
 import { CycleStore } from "../store/store"
 import { TddState, type TddCycle } from "../types/cycle"
@@ -7,6 +10,24 @@ import { DEFAULT_CONFIG } from "../types/config"
 import { makeCheckpoint, requireRedExecution, requireFullGreenCoverage, verifyProtectedTests, getRequiredRedTestFiles, getCoveredRedTestFiles } from "../enforce/checks"
 import { runTest } from "../testrun/runner"
 import { createClassifier } from "../classify/classifier"
+import { trace } from "../log/trace"
+
+async function resolvePluginVersion(): Promise<{ name: string; version: string; root: string; description?: string }> {
+  try {
+    const here = path.dirname(fileURLToPath(import.meta.url))
+    const pkgPath = path.resolve(here, "../../package.json")
+    const raw = await readFile(pkgPath, "utf8")
+    const pkg = JSON.parse(raw) as { name?: string; version?: string; description?: string }
+    return {
+      name: pkg.name ?? "kilo-tdd-plugin",
+      version: pkg.version ?? "unknown",
+      description: pkg.description,
+      root: path.dirname(pkgPath),
+    }
+  } catch {
+    return { name: "kilo-tdd-plugin", version: "unknown", root: "unknown" }
+  }
+}
 
 export function createTools(store: CycleStore, directory: string, config = DEFAULT_CONFIG, configSource = "defaults") {
   const git = new GitClient(directory)
@@ -112,11 +133,14 @@ export function createTools(store: CycleStore, directory: string, config = DEFAU
 
         const targetTests = normalizeTargets(args.testFiles, testFilesOnly.length ? testFilesOnly : tests, directory)
         // Run/record test execution now (plugin verifies independently)
+        await trace(directory, "tdd_commit_red.run_start", { sessionId: context.sessionID, cycleId: cycle.id, command: args.command, targetTests })
         const exec = await runTest({ cwd: directory, command: args.command, targetTests, runners: config.testRunners })
         cycle.redExecution = exec
+        await trace(directory, "tdd_commit_red.run_result", { sessionId: context.sessionID, cycleId: cycle.id, verdict: exec.verdict, exitCode: exec.exitCode, verdictReason: exec.verdictReason, attributedFiles: exec.attributedFiles ?? [] })
         if (exec.verdict !== false) {
           store.appendLog(cycle, { at: Date.now(), state: cycle.state, tool: "tdd_commit_red", action: "verify-red", ok: false, detail: exec.verdictReason })
           await store.save(cycle)
+          await trace(directory, "tdd_commit_red.reject", { sessionId: context.sessionID, cycleId: cycle.id, reason: exec.verdictReason })
           throw new TddError(exec.hadCompileError ? TddErrorCode.COMPILE_ERROR : exec.skipped ? TddErrorCode.SKIPPED_TEST : exec.verdict === true ? TddErrorCode.NOT_RED : TddErrorCode.AMBIGUOUS_RESULT, `TDD enforcement: Cannot commit RED. ${exec.verdictReason}`)
         }
 
@@ -252,11 +276,14 @@ export function createTools(store: CycleStore, directory: string, config = DEFAU
         const fallbackBase = dirtyTestFiles.length ? dirtyTestFiles : (dirtyTests.length ? dirtyTests : Object.keys(cycle.redCommit.files).filter((f) => !f.endsWith("/")))
         const targetTests = normalizeTargets(args.testFiles, fallbackBase, directory)
 
+        await trace(directory, "tdd_amend_red.run_start", { sessionId: context.sessionID, cycleId: cycle.id, command: args.command, targetTests })
         const exec = await runTest({ cwd: directory, command: args.command, targetTests, runners: config.testRunners })
         cycle.redExecution = exec
+        await trace(directory, "tdd_amend_red.run_result", { sessionId: context.sessionID, cycleId: cycle.id, verdict: exec.verdict, exitCode: exec.exitCode, verdictReason: exec.verdictReason, attributedFiles: exec.attributedFiles ?? [] })
         if (exec.verdict !== false) {
           store.appendLog(cycle, { at: Date.now(), state: cycle.state, tool: "tdd_amend_red", action: "verify-red", ok: false, detail: exec.verdictReason })
           await store.save(cycle)
+          await trace(directory, "tdd_amend_red.reject", { sessionId: context.sessionID, cycleId: cycle.id, reason: exec.verdictReason })
           throw new TddError(TddErrorCode.NOT_RED, `TDD enforcement: Corrected test must be RED. ${exec.verdictReason}`)
         }
 
@@ -305,7 +332,9 @@ export function createTools(store: CycleStore, directory: string, config = DEFAU
             explicitScope = false
           }
         }
+        await trace(directory, "tdd_verify_green.run_start", { sessionId: context.sessionID, cycleId: cycle.id, command: args.command, targetTests, explicitScope, requiredRedTests, protectedTests, providedTestFiles: args.testFiles ?? null })
         const exec = await runTest({ cwd: directory, command: args.command, targetTests, runners: config.testRunners })
+        await trace(directory, "tdd_verify_green.run_result_raw", { sessionId: context.sessionID, cycleId: cycle.id, verdict: exec.verdict, exitCode: exec.exitCode, verdictReason: exec.verdictReason, attributedFiles: exec.attributedFiles ?? [] })
         const relDir = directory.replace(/\\/g, "/").replace(/\/+$/, "")
         const toRel = (f: string) => {
           let s = f.replace(/\\/g, "/")
@@ -323,12 +352,15 @@ export function createTools(store: CycleStore, directory: string, config = DEFAU
         }
         const intendedRequired = requiredRedTests.filter((f) => targetTests.some((t) => toRel(t) === f || t.endsWith("/" + f) || t === f))
         const missingAttributed = intendedRequired.filter((f) => !attributedNow.has(f))
+        await trace(directory, "tdd_verify_green.attribution", { sessionId: context.sessionID, cycleId: cycle.id, explicitScope, attributedNow: [...attributedNow], intendedRequired, missingAttributed, requiredRedTests })
         if (exec.verdict === true && missingAttributed.length > 0) {
           // fail closed: green run cannot prove coverage for intended required targets
           execVerdictOverride(exec, null, `${exec.verdictReason} Cannot attribute GREEN coverage to required test(s): ${missingAttributed.join(", ")}. Provide explicit testFiles/structured report or a scoped command whose output references them.`)
+          await trace(directory, "tdd_verify_green.verdict_overridden", { sessionId: context.sessionID, cycleId: cycle.id, verdict: exec.verdict, verdictReason: exec.verdictReason })
         }
         if (!cycle.greenExecutions) cycle.greenExecutions = []
         cycle.greenExecutions.push(exec)
+        await trace(directory, "tdd_verify_green.final", { sessionId: context.sessionID, cycleId: cycle.id, verdict: exec.verdict, exitCode: exec.exitCode, verdictReason: exec.verdictReason, attributedFiles: exec.attributedFiles ?? [] })
         if (exec.verdict === true) {
           const covered = getCoveredRedTestFiles(cycle, directory, config)
           const missing = requiredRedTests.filter((f) => !covered.includes(f))
@@ -336,16 +368,19 @@ export function createTools(store: CycleStore, directory: string, config = DEFAU
             cycle.state = TddState.GREEN_VERIFICATION
             store.appendLog(cycle, { at: Date.now(), state: cycle.state, tool: "tdd_verify_green", action: "green-partial", ok: true, detail: `${exec.verdictReason}; missing coverage: ${missing.join(", ")}` })
             await store.save(cycle)
+            await trace(directory, "tdd_verify_green.partial", { sessionId: context.sessionID, cycleId: cycle.id, covered, missing })
             return `GREEN verified for this command.\n${exec.verdictReason}\nCovered RED tests: ${covered.join(", ") || "(none)"}\nMissing RED tests: ${missing.join(", ")}\nState: ${cycle.state}\n\nRun tdd_verify_green for remaining test scopes/commands until all RED tests are covered, then review refactoring and call tdd_commit_green.`
           }
           cycle.state = TddState.REFACTOR_REVIEW
           store.appendLog(cycle, { at: Date.now(), state: cycle.state, tool: "tdd_verify_green", action: "green", ok: true, detail: exec.verdictReason })
           await store.save(cycle)
+          await trace(directory, "tdd_verify_green.success", { sessionId: context.sessionID, cycleId: cycle.id, covered })
           return `GREEN verified for all required RED tests.\n${exec.verdictReason}\nCovered RED tests: ${covered.join(", ") || "(none)"}\nState: ${cycle.state}\n\nNext: review refactoring. Call tdd_commit_green with refactor notes when ready.`
         }
         cycle.state = TddState.IMPLEMENTATION
         store.appendLog(cycle, { at: Date.now(), state: cycle.state, tool: "tdd_verify_green", action: "green-fail", ok: false, detail: exec.verdictReason })
         await store.save(cycle)
+        await trace(directory, "tdd_verify_green.reject", { sessionId: context.sessionID, cycleId: cycle.id, verdict: exec.verdict, exitCode: exec.exitCode, reason: exec.verdictReason })
         throw new TddError(TddErrorCode.NOT_GREEN, `TDD enforcement: GREEN not established. ${exec.verdictReason}`)
       })
     },
@@ -403,6 +438,218 @@ export function createTools(store: CycleStore, directory: string, config = DEFAU
     },
   })
 
+  const tdd_abort = tool({
+    description: "Abort a freshly started TDD cycle with no recorded work. Only allowed in RED_TEST with no commits, no recorded executions, no snapshots/counters, a clean working tree (excluding ignored files), and no in-progress git operation. This is the inverse of tdd_start and does not modify git history or working files.",
+    args: {},
+    async execute(_args, context) {
+      return store.withLock(context.sessionID, async () => {
+        const cycle = store.requireActive(await store.getActive(context.sessionID))
+        store.requireState(cycle, [TddState.RED_TEST], "tdd_abort")
+
+        if (!(await git.isRepo())) throw new TddError(TddErrorCode.BLOCKED, "TDD enforcement: Not a git repository.")
+        const op = await git.inProgressOperation()
+        if (op) throw new TddError(TddErrorCode.GIT_OPERATION_IN_PROGRESS, `TDD enforcement: Git operation in progress (${op}). Resolve it before aborting.`)
+
+        if (cycle.redCommit || cycle.greenCommit) {
+          throw new TddError(TddErrorCode.BLOCKED, "TDD enforcement: Cannot abort after a RED/GREEN commit has been created. Use tdd_discard_cycle to explicitly roll back and discard cycle changes.")
+        }
+        if (cycle.amendCount !== 0 || cycle.revertCount !== 0) {
+          throw new TddError(TddErrorCode.BLOCKED, "TDD enforcement: Cannot abort after amendments or reverts have been recorded.")
+        }
+        if ((cycle.implSnapshots ?? []).length > 0) {
+          throw new TddError(TddErrorCode.BLOCKED, "TDD enforcement: Cannot abort when implementation snapshots exist.")
+        }
+        if (cycle.redExecution || (cycle.greenExecutions ?? []).length > 0) {
+          throw new TddError(TddErrorCode.BLOCKED, "TDD enforcement: Cannot abort after test executions have been recorded. Discard any changes manually if needed.")
+        }
+
+        const dirty = (await git.allDirtyFiles()).filter((f) => !classifier.isExcluded(pathJoin(directory, f)))
+        if (dirty.length > 0) {
+          throw new TddError(TddErrorCode.DIRTY_WORKTREE, `TDD enforcement: Cannot abort with uncommitted changes. Revert or remove them before aborting. Dirty: ${dirty.join(", ")}`)
+        }
+
+        store.appendLog(cycle, { at: Date.now(), state: cycle.state, tool: "tdd_abort", action: "abort", ok: true, detail: "Aborted fresh cycle (no commits/executions/changes)" })
+        cycle.state = TddState.IDLE
+        ;(cycle as any).updatedAt = Date.now()
+        await store.save(cycle)
+        // clear active pointer explicitly (do before and after save is not necessary; ensure cleared)
+        await store.setActive(context.sessionID, null)
+        await trace(directory, "tdd_abort", { sessionId: context.sessionID, cycleId: cycle.id, activeCleared: true })
+        return [
+          `TDD cycle aborted.`,
+          `- cycle: ${cycle.id}`,
+          `- behavior: ${(cycle as any).behavior ?? "(unknown)"}`,
+          `- state: ${cycle.state}`,
+          `- active: cleared`,
+          `No git history or working files were modified.`,
+        ].join("\n")
+      })
+    },
+  })
+
+  const tdd_discard_cycle = tool({
+    description: "Discard the current TDD cycle and roll back to the state when the cycle started (base commit). Destructive: discards uncommitted cycle changes in RED_TEST, or removes the cycle's RED commit(s) and cycle-related working/index changes after a RED commit, to restore a clean, tdd_start-ready tree. Fails closed if rollback cannot be proven safe/consistent.",
+    args: {},
+    async execute(_args, context) {
+      return store.withLock(context.sessionID, async () => {
+        const cycle = store.requireActive(await store.getActive(context.sessionID))
+        const allowed = [
+          TddState.RED_TEST,
+          TddState.TEST_CORRECTION,
+          TddState.IMPLEMENTATION,
+          TddState.GREEN_VERIFICATION,
+          TddState.REFACTOR_REVIEW,
+        ]
+        store.requireState(cycle, allowed, "tdd_discard_cycle")
+
+        if (!(await git.isRepo())) throw new TddError(TddErrorCode.BLOCKED, "TDD enforcement: Not a git repository.")
+        const op = await git.inProgressOperation()
+        if (op) throw new TddError(TddErrorCode.GIT_OPERATION_IN_PROGRESS, `TDD enforcement: Git operation in progress (${op}). Resolve it before discarding.`)
+        if (cycle.greenCommit) throw new TddError(TddErrorCode.BLOCKED, "TDD enforcement: Cannot discard a cycle that has a GREEN commit.")
+
+        const head = await git.head()
+        const branch = await git.branch()
+        if (branch !== cycle.branch) {
+          throw new TddError(TddErrorCode.BLOCKED, `TDD enforcement: Current branch (${branch}) does not match cycle branch (${cycle.branch}).`)
+        }
+        const baseOk = await git.run(["cat-file", "-e", `${cycle.baseSha}^{commit}`])
+        if (baseOk.exitCode !== 0) {
+          throw new TddError(TddErrorCode.PERSISTENCE_ERROR, `TDD enforcement: Base commit ${cycle.baseSha.slice(0, 7)} no longer exists; cannot roll back.`)
+        }
+
+        // Pre-commit discard (RED_TEST): no RED commit yet; discard uncommitted cycle changes back to clean base.
+        if (!cycle.redCommit) {
+          if (cycle.state !== TddState.RED_TEST) {
+            throw new TddError(TddErrorCode.NOT_FOUND, "TDD enforcement: No RED commit recorded; nothing to roll back.")
+          }
+          if (head !== cycle.baseSha) {
+            throw new TddError(TddErrorCode.INTEGRITY_CHECK_FAILED, `TDD enforcement: HEAD (${head.slice(0, 7)}) does not match cycle base (${cycle.baseSha.slice(0, 7)}). Refusing to discard unexpected changes/history.`)
+          }
+
+          const dirtyNow = (await git.allDirtyFiles()).filter((f) => !classifier.isExcluded(pathJoin(directory, f)))
+          const affected = [...new Set(dirtyNow)]
+          await trace(directory, "tdd_discard_cycle.start", { sessionId: context.sessionID, cycleId: cycle.id, state: cycle.state, head, baseSha: cycle.baseSha, redCommit: null, affected, dirtyNow })
+
+          const removed: string[] = []
+          const restored: string[] = []
+          const failed: string[] = []
+          const { rm: rmFs } = await import("node:fs/promises")
+
+          for (const f of affected) {
+            const inBase = await git.run(["cat-file", "-e", `${cycle.baseSha}:${f}`])
+            if (inBase.exitCode === 0) {
+              const co = await git.run(["checkout", cycle.baseSha, "--", f])
+              if (co.exitCode === 0) restored.push(f)
+              else failed.push(`${f}: ${(co.stderr || co.stdout).trim()}`)
+            } else {
+              await git.run(["rm", "--cached", "--ignore-unmatch", "--", f])
+              try { await rmFs(pathJoin(directory, f), { force: true, recursive: false }) } catch {}
+              removed.push(f)
+            }
+          }
+
+          await git.run(["reset", "--mixed", cycle.baseSha])
+
+          const remainingDirty = (await git.allDirtyFiles()).filter((f) => !classifier.isExcluded(pathJoin(directory, f)))
+          if (failed.length > 0 || remainingDirty.length > 0) {
+            const detail = `cleanup incomplete; restored: ${restored.join(", ") || "none"}; removed: ${removed.join(", ") || "none"}; failed: ${failed.join("; ") || "none"}; remaining dirty: ${remainingDirty.join(", ") || "none"}`
+            store.appendLog(cycle, { at: Date.now(), state: cycle.state, tool: "tdd_discard_cycle", action: "discard", ok: false, detail })
+            await store.save(cycle)
+            await trace(directory, "tdd_discard_cycle.failed", { sessionId: context.sessionID, cycleId: cycle.id, detail })
+            throw new TddError(TddErrorCode.INTEGRITY_CHECK_FAILED, `TDD enforcement: Discard incomplete; working tree is not clean at base. Manual recovery required. ${detail}`)
+          }
+
+          store.appendLog(cycle, { at: Date.now(), state: cycle.state, tool: "tdd_discard_cycle", action: "discard", ok: true, detail: `Discarded uncommitted RED_TEST changes at base ${cycle.baseSha.slice(0, 7)}; restored: ${restored.join(", ") || "none"}; removed: ${removed.join(", ") || "none"}` })
+          cycle.state = TddState.IDLE
+          ;(cycle as any).updatedAt = Date.now()
+          await store.save(cycle)
+          await store.setActive(context.sessionID, null)
+          await trace(directory, "tdd_discard_cycle.success", { sessionId: context.sessionID, cycleId: cycle.id, baseSha: cycle.baseSha, restored, removed, redCommit: null })
+          return [
+            `TDD cycle discarded and rolled back to cycle start.`,
+            `- cycle: ${cycle.id}`,
+            `- behavior: ${(cycle as any).behavior ?? "(unknown)"}`,
+            `- branch: ${cycle.branch}`,
+            `- base: ${cycle.baseSha.slice(0, 7)}`,
+            `- discarded RED: (none, uncommitted)`,
+            `- restored: ${restored.join(", ") || "(none)"}`,
+            `- removed: ${removed.join(", ") || "(none)"}`,
+            `- active: cleared`,
+            `Working tree is clean (excluding ignored files). You can start a new cycle with tdd_start.`,
+          ].join("\n")
+        }
+
+        // Post-commit discard: roll back RED commit(s) to base.
+        if (head !== cycle.redCommit.sha) {
+          throw new TddError(TddErrorCode.INTEGRITY_CHECK_FAILED, `TDD enforcement: HEAD (${head.slice(0, 7)}) does not match cycle RED commit (${cycle.redCommit.shortSha}). Refusing to discard to avoid rewriting unexpected history.`)
+        }
+
+        const dirtyNow = (await git.allDirtyFiles()).filter((f) => !classifier.isExcluded(pathJoin(directory, f)))
+        const redFiles = Object.keys(cycle.redCommit.files).filter((f) => !f.endsWith("/"))
+        const snapFiles = (cycle.implSnapshots ?? []).flatMap((s) => s.files ?? [])
+        const affected = [...new Set([...redFiles, ...dirtyNow, ...snapFiles])].filter((f) => !classifier.isExcluded(pathJoin(directory, f)))
+
+        await trace(directory, "tdd_discard_cycle.start", { sessionId: context.sessionID, cycleId: cycle.id, state: cycle.state, head, baseSha: cycle.baseSha, redCommit: cycle.redCommit.sha, affected, dirtyNow })
+
+        // Move HEAD/index back to base commit (no --hard). Working tree will then differ for affected files.
+        const reset = await git.run(["reset", "--mixed", cycle.baseSha])
+        if (reset.exitCode !== 0) {
+          throw new TddError(TddErrorCode.BLOCKED, `TDD enforcement: Failed to reset branch to base ${cycle.baseSha.slice(0, 7)}: ${(reset.stderr || reset.stdout).trim()}`)
+        }
+
+        const removed: string[] = []
+        const restored: string[] = []
+        const failed: string[] = []
+        const { rm: rmFs } = await import("node:fs/promises")
+
+        for (const f of affected) {
+          const inBase = await git.run(["cat-file", "-e", `${cycle.baseSha}:${f}`])
+          if (inBase.exitCode === 0) {
+            const co = await git.run(["checkout", cycle.baseSha, "--", f])
+            if (co.exitCode === 0) restored.push(f)
+            else failed.push(`${f}: ${(co.stderr || co.stdout).trim()}`)
+          } else {
+            // file did not exist at base (added by RED/cycle); remove from worktree/index if present
+            await git.run(["rm", "--cached", "--ignore-unmatch", "--", f])
+            try { await rmFs(pathJoin(directory, f), { force: true, recursive: false }) } catch {}
+            removed.push(f)
+          }
+        }
+
+        // ensure index matches base (checkout may have staged restored files)
+        await git.run(["reset", "--mixed", cycle.baseSha])
+
+        const remainingDirty = (await git.allDirtyFiles()).filter((f) => !classifier.isExcluded(pathJoin(directory, f)))
+        if (failed.length > 0 || remainingDirty.length > 0) {
+          const detail = `reset to ${cycle.baseSha.slice(0, 7)} done but cleanup incomplete; restored: ${restored.join(", ") || "none"}; removed: ${removed.join(", ") || "none"}; failed: ${failed.join("; ") || "none"}; remaining dirty: ${remainingDirty.join(", ") || "none"}`
+          store.appendLog(cycle, { at: Date.now(), state: cycle.state, tool: "tdd_discard_cycle", action: "discard", ok: false, detail })
+          await store.save(cycle)
+          await trace(directory, "tdd_discard_cycle.failed", { sessionId: context.sessionID, cycleId: cycle.id, detail })
+          throw new TddError(TddErrorCode.INTEGRITY_CHECK_FAILED, `TDD enforcement: Discard incomplete; working tree is not clean at base. Manual recovery required. ${detail}`)
+        }
+
+        store.appendLog(cycle, { at: Date.now(), state: cycle.state, tool: "tdd_discard_cycle", action: "discard", ok: true, detail: `Rolled back RED ${cycle.redCommit.shortSha} to base ${cycle.baseSha.slice(0, 7)}; restored: ${restored.join(", ") || "none"}; removed: ${removed.join(", ") || "none"}` })
+        cycle.state = TddState.IDLE
+        ;(cycle as any).updatedAt = Date.now()
+        await store.save(cycle)
+        await store.setActive(context.sessionID, null)
+        await trace(directory, "tdd_discard_cycle.success", { sessionId: context.sessionID, cycleId: cycle.id, baseSha: cycle.baseSha, restored, removed })
+        return [
+          `TDD cycle discarded and rolled back to cycle start.`,
+          `- cycle: ${cycle.id}`,
+          `- behavior: ${(cycle as any).behavior ?? "(unknown)"}`,
+          `- branch: ${cycle.branch}`,
+          `- base: ${cycle.baseSha.slice(0, 7)}`,
+          `- discarded RED: ${cycle.redCommit.shortSha}`,
+          `- restored: ${restored.join(", ") || "(none)"}`,
+          `- removed: ${removed.join(", ") || "(none)"}`,
+          `- active: cleared`,
+          `Working tree is clean (excluding ignored files). You can start a new cycle with tdd_start.`,
+        ].join("\n")
+      })
+    },
+  })
+
   const tdd_finish = tool({
     description: "Finish the current TDD cycle and generate its report. Returns the cycle to IDLE.",
     args: {},
@@ -450,7 +697,26 @@ export function createTools(store: CycleStore, directory: string, config = DEFAU
     },
   })
 
-  return { tdd_start, tdd_status, tdd_commit_red, tdd_revert_implementation, tdd_restore_implementation, tdd_amend_red, tdd_verify_green, tdd_commit_green, tdd_finish }
+  const tdd_version = tool({
+    description: "Show the kilo-tdd-plugin version and runtime info (resolved dynamically from the loaded plugin).",
+    args: {},
+    async execute() {
+      const info = await resolvePluginVersion()
+      const lines = [
+        `kilo-tdd-plugin`,
+        `- name: ${info.name}`,
+        `- version: ${info.version}`,
+        `- plugin root: ${info.root}`,
+        `- node: ${process.version}`,
+        `- platform: ${process.platform}/${process.arch}`,
+        `- pid: ${process.pid}`,
+      ]
+      if (info.description) lines.splice(3, 0, `- description: ${info.description}`)
+      return lines.join("\n")
+    },
+  })
+
+  return { tdd_start, tdd_status, tdd_commit_red, tdd_revert_implementation, tdd_restore_implementation, tdd_amend_red, tdd_verify_green, tdd_commit_green, tdd_abort, tdd_discard_cycle, tdd_finish, tdd_version }
 }
 
 

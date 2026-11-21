@@ -1,9 +1,14 @@
 import { describe, it, expect } from "vitest"
-import { mkdtemp, writeFile, rm } from "node:fs/promises"
+import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { buildCommandForRun, runTest } from "../../src/testrun/runner"
 import type { TestRunnerConfig } from "../../src/types/config"
+
+function shellQuote(s: string): string {
+  if (/^[A-Za-z0-9_./:@=-]+$/.test(s)) return s
+  return `'${s.replace(/'/g, `'\\''`)}'`
+}
 
 describe("runner command building and report ingestion", () => {
   it("builds scoped command from runner config when enabled", () => {
@@ -35,6 +40,35 @@ describe("runner command building and report ingestion", () => {
       const exec = await runTest({ cwd: dir, command: `node run.cjs`, targetTests: ["tests/a.test.js"], runners })
       expect(exec.verdict).toBe(false)
       expect(exec.verdictReason).toMatch(/report:json/i)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("does not inject guessed report flags for npm script runners (uses explicit reportArgs if provided)", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "kilo-tdd-run-"))
+    try {
+      // records argv; exits nonzero to ensure classification path would notice injected flags if present
+      await writeFile(path.join(dir, "pkg-wrap.cjs"), `const fs=require('fs'); const path=require('path'); fs.writeFileSync(path.join(__dirname,'argv.json'), JSON.stringify(process.argv.slice(2))); process.exit(1);`)
+      const runners: TestRunnerConfig[] = [{ id: "npm", match: ["node pkg-wrap.cjs"], reportFormat: "auto", scopeArgs: ()=>[] }]
+      const exec = await runTest({ cwd: dir, command: `node pkg-wrap.cjs --run tests/a.test.js`, targetTests: ["tests/a.test.js"], runners })
+      const argv = JSON.parse(await readFile(path.join(dir, "argv.json"), "utf8")) as string[]
+      expect(argv).toContain("--run")
+      expect(argv).not.toContain("--json")
+      expect(argv.some((a) => String(a).includes("--output-file"))).toBe(false)
+      expect(exec.command).not.toContain("--json")
+      // unmodified command echoed in trace/output context is not enough to treat as RED test failure
+      expect(exec.verdict).toBe(null)
+      expect(exec.verdictReason).toMatch(/Target test\(s\) not observed in output|ambiguous|cannot confirm valid RED/i)
+
+      // but explicit reportArgs are honored
+      await rm(path.join(dir, "argv.json"), { force: true })
+      const runners2: TestRunnerConfig[] = [{ id: "npm", match: ["node pkg-wrap.cjs"], reportFormat: "json", reportArgs: ["--json-out", "{file}"], scopeArgs: ()=>[] }]
+      const exec2 = await runTest({ cwd: dir, command: `node pkg-wrap.cjs --run tests/a.test.js`, targetTests: ["tests/a.test.js"], runners: runners2 })
+      const argv2 = JSON.parse(await readFile(path.join(dir, "argv.json"), "utf8")) as string[]
+      expect(argv2).toContain("--json-out")
+      expect(argv2.some((a) => String(a).includes(".kilo/tdd/reports/") && a.endsWith(".json"))).toBe(true)
+      expect(exec2.command).toContain("--json-out")
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
